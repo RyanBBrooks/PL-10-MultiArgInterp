@@ -1,6 +1,7 @@
 #lang plait
 
 (define-type Value
+  (boolV [b : Boolean])
   (numV [n : Number])
   (closV [arg : Symbol]
          [body : Exp]
@@ -9,10 +10,16 @@
 (define-type Exp
   (numE [n : Number])
   (idE [s : Symbol])
+  (boolE [b : Boolean])
   (plusE [l : Exp] 
          [r : Exp])
   (multE [l : Exp]
          [r : Exp])
+  (equalE [l : Exp]
+          [r : Exp])
+  (ifE [c : Exp]
+       [t : Exp]
+       [e : Exp])
   (lamE [n : Symbol]
         [arg-type : Type]
         [body : Exp])
@@ -46,6 +53,8 @@
 ;; parse ----------------------------------------
 (define (parse [s : S-Exp]) : Exp
   (cond
+    [(s-exp-match? `true s) (boolE #t)]
+    [(s-exp-match? `false s) (boolE #f)]
     [(s-exp-match? `NUMBER s) (numE (s-exp->number s))]
     [(s-exp-match? `SYMBOL s) (idE (s-exp->symbol s))]
     [(s-exp-match? `{+ ANY ANY} s)
@@ -54,6 +63,13 @@
     [(s-exp-match? `{* ANY ANY} s)
      (multE (parse (second (s-exp->list s)))
             (parse (third (s-exp->list s))))]
+    [(s-exp-match? `{= ANY ANY} s)
+     (equalE (parse (second (s-exp->list s)))
+            (parse (third (s-exp->list s))))]
+    [(s-exp-match? `{if ANY ANY ANY} s)
+     (ifE (parse (second (s-exp->list s)))
+          (parse (third (s-exp->list s)))
+          (parse (fourth (s-exp->list s))))]
     [(s-exp-match? `{let {[SYMBOL : ANY ANY]} ANY} s)
      (let ([bs (s-exp->list (first
                              (s-exp->list (second
@@ -120,12 +136,24 @@
 ;; interp ----------------------------------------
 (define (interp [a : Exp] [env : Env]) : Value
   (type-case Exp a
+    [(boolE b) (boolV b)]
     [(numE n) (numV n)]
     [(idE s) (lookup s env)]
     [(plusE l r) (num+ (interp l env) (interp r env))]
     [(multE l r) (num* (interp l env) (interp r env))]
     [(lamE n t body)
      (closV n body env)]
+
+    [(ifE c t e) (type-case Value (interp c env)
+                   [(boolV b) (if b
+                                  (interp t env)
+                                  (interp e env))]
+                   [else (error 'interp "not a boolean")])]
+
+    [(equalE l r) (if (equal? (interp l env) (interp r env))
+                      (boolV #t)
+                      (boolV #f))]
+    
     [(appE fun arg) (type-case Value (interp fun env)
                       [(closV n body c-env)
                        (interp body
@@ -136,6 +164,18 @@
                       [else (error 'interp "not a function")])]))
 
 (module+ test
+  (test (interp (parse `true) mt-env)
+        (boolV #t))
+  (test (interp (parse `false) mt-env)
+        (boolV #f))
+  (test (interp (parse `{= 1 2}) mt-env)
+        (boolV #f))
+  (test (interp (parse `{= true true}) mt-env)
+        (boolV #t))
+  (test (interp (parse `{if true false true}) mt-env)
+        (boolV #f))
+  (test (interp (parse `{if false 9 8}) mt-env)
+        (numV 8))
   (test (interp (parse `2) mt-env)
         (numV 2))
   (test/exn (interp (parse `x) mt-env)
@@ -173,6 +213,8 @@
 
   (test/exn (interp (parse `{1 2}) mt-env)
             "not a function")
+  (test/exn (interp (parse `{if 1 2 3}) mt-env)
+            "not a boolean")
   (test/exn (interp (parse `{+ 1 {lambda {[x : num]} x}}) mt-env)
             "not a number")
   (test/exn (interp (parse `{let {[bad : (num -> num) {lambda {[x : num]} {+ x y}}]}
@@ -228,9 +270,20 @@
 ;; typecheck ----------------------------------------
 (define (typecheck [a : Exp] [tenv : Type-Env]) : Type
   (type-case Exp a
+    [(boolE b) (boolT)]
     [(numE n) (numT)]
     [(plusE l r) (typecheck-nums l r tenv)]
     [(multE l r) (typecheck-nums l r tenv)]
+    
+    [(ifE c t e)
+     (type-case Type (typecheck c tenv)
+       [(boolT) (typecheck-same t e tenv)]
+       [else (type-error c "bool")])]
+
+    [(equalE l r) (begin
+                    (typecheck-same l r tenv)
+                    (boolT))]
+    
     [(idE n) (type-lookup n tenv)]
     [(lamE n arg-type body)
      (arrowT arg-type
@@ -246,6 +299,12 @@
             (type-error arg
                         (to-string arg-type)))]
        [else (type-error fun "function")])]))
+
+(define (typecheck-same l r tenv)
+  (let ([t1 (typecheck l tenv)])
+          (if (equal? t1 (typecheck r tenv))
+              t1
+              (type-error r (to-string t1)))))
 
 (define (typecheck-nums l r tenv)
   (type-case Type (typecheck l tenv)
@@ -269,6 +328,12 @@
 (module+ test
   (test (typecheck (parse `10) mt-env)
         (numT))
+  (test (typecheck (parse `true) mt-env)
+        (boolT))
+  (test (typecheck (parse `false) mt-env)
+        (boolT))
+  (test (typecheck (parse `(= 1 1)) mt-env)
+        (boolT))
   (test (typecheck (parse `{+ 10 17}) mt-env)
         (numT))
   (test (typecheck (parse `{* 10 17}) mt-env)
@@ -291,6 +356,15 @@
         (numT))
 
   (test/exn (typecheck (parse `{1 2})
+                       mt-env)
+            "no type")
+  (test/exn (typecheck (parse `{= 1 false})
+                       mt-env)
+            "no type")
+  (test/exn (typecheck (parse `{if 1 true false})
+                       mt-env)
+            "no type")
+  (test/exn (typecheck (parse `{if true 1 false})
                        mt-env)
             "no type")
   (test/exn (typecheck (parse `{{lambda {[x : bool]} x} 2})
